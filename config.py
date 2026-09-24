@@ -16,7 +16,22 @@ APP_NAME = os.environ.get("FGT_APP_NAME", "FG Testing Tracker")
 # Online database (Postgres). On Render's free plan, set DATABASE_URL to the
 # connection string of a free Neon database so your data is kept permanently.
 # Leave it unset on your own computer; the app then uses a local SQLite file.
-DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
+def _clean_database_url(value):
+    """Undo common copy-paste mistakes: quotes, a leading 'psql', 'DATABASE_URL=' or a missing prefix."""
+    v = (value or "").strip()
+    if v.lower().startswith("psql "):
+        v = v[5:].strip()
+    if v.startswith("DATABASE_URL="):
+        v = v.split("=", 1)[1].strip()
+    v = v.strip("'\"").strip()
+    if v.startswith("postgres://"):
+        v = "postgresql://" + v[len("postgres://"):]
+    if v and "://" not in v and "@" in v:
+        v = "postgresql://" + v
+    return v
+
+
+DATABASE_URL = _clean_database_url(os.environ.get("DATABASE_URL", ""))
 
 # Folder for the local SQLite file (used only when DATABASE_URL is not set).
 # Lab reports themselves stay in Google Drive; the app only stores their links.

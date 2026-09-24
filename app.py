@@ -190,13 +190,27 @@ def _to_pg(sql):
     return _PG_NAMED.sub(r"%(\1)s", sql.replace("%", "%%")).replace("?", "%s")
 
 
+def _mask_secrets(text):
+    text = re.sub(r"(://[^:/@\s]+:)[^@\s]+@", r"\1****@", text)
+    return re.sub(r"npg_\w+", "npg_****", text)
+
+
 class Database:
     """One connection to either Postgres (online) or SQLite (on your own computer)."""
 
     def __init__(self):
         if USE_PG:
-            self.conn = psycopg.connect(config.DATABASE_URL, row_factory=dict_row,
-                                        prepare_threshold=None, connect_timeout=20)
+            try:
+                self.conn = psycopg.connect(config.DATABASE_URL, row_factory=dict_row,
+                                            prepare_threshold=None, connect_timeout=20)
+            except psycopg.ProgrammingError:
+                # Don't let the error text print the password into the logs.
+                raise RuntimeError(
+                    "DATABASE_URL is not a valid connection string. In Neon, click Connect, use the copy "
+                    "button, and paste the whole value into Render. It must look like "
+                    "postgresql://USER:PASSWORD@HOST/neondb?sslmode=require") from None
+            except psycopg.OperationalError as exc:
+                raise RuntimeError("Could not connect to the database: " + _mask_secrets(str(exc))) from None
         else:
             self.conn = sqlite3.connect(DB_PATH, timeout=15)
             self.conn.row_factory = sqlite3.Row
