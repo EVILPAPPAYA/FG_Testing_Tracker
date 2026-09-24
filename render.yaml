@@ -1,0 +1,24 @@
+# Render Blueprint for the FG Testing Tracker.
+# In Render: New > Blueprint, pick this repository, fill in the two passwords, Apply.
+services:
+  - type: web
+    name: fg-testing-tracker
+    runtime: python
+    plan: 0.5c-512mb          # smallest paid plan (was called "Starter"); needed for the disk
+    region: singapore         # closest Render region to India
+    buildCommand: pip install -r requirements.txt
+    startCommand: python app.py
+    healthCheckPath: /healthz
+    disk:
+      name: tracker-data
+      mountPath: /var/data    # the database lives here and survives restarts
+      sizeGB: 1
+    envVars:
+      - key: FGT_DATA_DIR
+        value: /var/data
+      - key: FGT_SECRET_KEY
+        generateValue: true
+      - key: FGT_TEAM_PASSWORD   # everyone signs in with this
+        sync: false
+      - key: FGT_ADMIN_PASSWORD  # opens Test schedule and Settings
+        sync: false
