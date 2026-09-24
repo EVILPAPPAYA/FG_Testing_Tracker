@@ -13,8 +13,12 @@ ON_RENDER = bool(os.environ.get("RENDER"))
 # Name shown in the sidebar and in email subjects.
 APP_NAME = os.environ.get("FGT_APP_NAME", "FG Testing Tracker")
 
-# Folder that holds the database. On Render this must be the persistent disk's
-# mount path (e.g. /var/data), or everything is lost when the app restarts.
+# Online database (Postgres). On Render's free plan, set DATABASE_URL to the
+# connection string of a free Neon database so your data is kept permanently.
+# Leave it unset on your own computer; the app then uses a local SQLite file.
+DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
+
+# Folder for the local SQLite file (used only when DATABASE_URL is not set).
 # Lab reports themselves stay in Google Drive; the app only stores their links.
 DATA_DIR = os.environ.get("FGT_DATA_DIR", BASE_DIR)
 

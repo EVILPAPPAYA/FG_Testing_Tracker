@@ -2,7 +2,7 @@
 
 A small web app for logging finished-goods lab tests for each flavour, keeping the Google Drive link to each lab report, and warning you before any test falls due.
 
-It runs on one computer in your office, and everyone else on the same network opens it in their browser. To host it online instead, so it works from anywhere, follow **DEPLOY_RENDER.md**.
+It runs on one computer in your office, and everyone else on the same network opens it in their browser. To host it online instead, so it works from anywhere, follow **DEPLOY_RENDER.md** (free Render plan with a free Neon database).
 
 ## What's inside
 
@@ -94,9 +94,9 @@ The app will now start whenever someone logs in to that computer.
 
 ## Backups
 
-All the app's data (flavours, tests, dates, results, report links and settings) lives in one file, `data.db`. The reports themselves stay in Google Drive.
+On your own computer, all the app's data (flavours, tests, dates, results, report links and settings) lives in one file, `data.db`. The reports themselves stay in Google Drive.
 
-Once a week, go to **Settings** in the back end and click **Download backup (.zip)**. It contains `data.db` plus `all-test-entries.csv`, a spreadsheet of every entry with its report link that opens in Excel.
+Once a week, go to **Settings** in the back end and click **Download backup (.zip)**. It contains `all-test-entries.csv`, a spreadsheet of every entry with its report link that opens in Excel, and `all-data.json`, a complete copy of the data.
 
 ## Starting fresh
 

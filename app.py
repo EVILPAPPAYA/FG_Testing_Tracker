@@ -7,7 +7,9 @@ Run:  python app.py      then open http://localhost:5000
 """
 import calendar
 import csv
+import functools
 import io
+import json
 import os
 import re
 import smtplib
@@ -36,6 +38,15 @@ def _abs(p):
 
 
 DB_PATH = _abs(config.DB_PATH)
+USE_PG = bool(config.DATABASE_URL)
+STORAGE_WARNING = ""  # shown in the app if data can't be kept permanently
+
+if USE_PG:
+    import psycopg
+    from psycopg.rows import dict_row
+    DB_ERRORS = (sqlite3.Error, psycopg.Error)
+else:
+    DB_ERRORS = (sqlite3.Error,)
 
 app = Flask(__name__)
 app.secret_key = config.SECRET_KEY
@@ -63,7 +74,7 @@ DEFAULT_SETTINGS = {
     "last_digest": "",
 }
 
-SCHEMA = """
+SCHEMA_SQLITE = """
 CREATE TABLE IF NOT EXISTS flavours(
     id INTEGER PRIMARY KEY,
     name TEXT NOT NULL UNIQUE COLLATE NOCASE,
@@ -117,13 +128,101 @@ CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT);
 """
 
 
+SCHEMA_PG = [
+    """CREATE TABLE IF NOT EXISTS flavours(
+        id SERIAL PRIMARY KEY,
+        name TEXT NOT NULL,
+        category TEXT NOT NULL DEFAULT 'existing',
+        notes TEXT NOT NULL DEFAULT '',
+        active INTEGER NOT NULL DEFAULT 1,
+        created_at TEXT NOT NULL)""",
+    "CREATE UNIQUE INDEX IF NOT EXISTS flavours_name_key ON flavours (lower(name))",
+    """CREATE TABLE IF NOT EXISTS tests(
+        id SERIAL PRIMARY KEY,
+        name TEXT NOT NULL,
+        covers TEXT NOT NULL DEFAULT '',
+        frequency_months INTEGER NOT NULL DEFAULT 12,
+        price DOUBLE PRECISION,
+        active INTEGER NOT NULL DEFAULT 1,
+        sort_order INTEGER NOT NULL DEFAULT 100)""",
+    "CREATE UNIQUE INDEX IF NOT EXISTS tests_name_key ON tests (lower(name))",
+    """CREATE TABLE IF NOT EXISTS submissions(
+        id SERIAL PRIMARY KEY,
+        flavour_id INTEGER NOT NULL REFERENCES flavours(id) ON DELETE CASCADE,
+        sample_date TEXT NOT NULL,
+        lab_name TEXT NOT NULL DEFAULT '',
+        status TEXT NOT NULL,
+        assigned_to TEXT NOT NULL DEFAULT '',
+        assigned_email TEXT NOT NULL DEFAULT '',
+        report_no TEXT NOT NULL DEFAULT '',
+        report_date TEXT,
+        report_link TEXT,
+        file_path TEXT,
+        original_filename TEXT,
+        remarks TEXT NOT NULL DEFAULT '',
+        created_by TEXT NOT NULL DEFAULT '',
+        uploaded_by TEXT NOT NULL DEFAULT '',
+        uploaded_at TEXT,
+        last_reminded TEXT,
+        source TEXT NOT NULL DEFAULT 'app',
+        created_at TEXT NOT NULL)""",
+    """CREATE TABLE IF NOT EXISTS submission_tests(
+        submission_id INTEGER NOT NULL REFERENCES submissions(id) ON DELETE CASCADE,
+        test_id INTEGER NOT NULL REFERENCES tests(id) ON DELETE CASCADE,
+        result TEXT NOT NULL DEFAULT '',
+        PRIMARY KEY(submission_id, test_id))""",
+    """CREATE TABLE IF NOT EXISTS exclusions(
+        flavour_id INTEGER NOT NULL REFERENCES flavours(id) ON DELETE CASCADE,
+        test_id INTEGER NOT NULL REFERENCES tests(id) ON DELETE CASCADE,
+        PRIMARY KEY(flavour_id, test_id))""",
+    "CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT)",
+]
+
+
 # ---------------------------------------------------------------- database
 
+_PG_NAMED = re.compile(r"(?<![:\w]):([A-Za-z_]\w*)")
+
+
+@functools.lru_cache(maxsize=512)
+def _to_pg(sql):
+    """Turn SQLite-style placeholders (? and :name) into Postgres ones (%s and %(name)s)."""
+    return _PG_NAMED.sub(r"%(\1)s", sql.replace("%", "%%")).replace("?", "%s")
+
+
+class Database:
+    """One connection to either Postgres (online) or SQLite (on your own computer)."""
+
+    def __init__(self):
+        if USE_PG:
+            self.conn = psycopg.connect(config.DATABASE_URL, row_factory=dict_row,
+                                        prepare_threshold=None, connect_timeout=20)
+        else:
+            self.conn = sqlite3.connect(DB_PATH, timeout=15)
+            self.conn.row_factory = sqlite3.Row
+            self.conn.execute("PRAGMA foreign_keys = ON")
+
+    def execute(self, sql, params=()):
+        return self.conn.execute(_to_pg(sql) if USE_PG else sql, params)
+
+    def insert(self, sql, params=()):
+        """Run an INSERT and return the new row's id."""
+        if USE_PG:
+            return self.conn.execute(_to_pg(sql) + " RETURNING id", params).fetchone()["id"]
+        return self.conn.execute(sql, params).lastrowid
+
+    def commit(self):
+        self.conn.commit()
+
+    def rollback(self):
+        self.conn.rollback()
+
+    def close(self):
+        self.conn.close()
+
+
 def connect():
-    conn = sqlite3.connect(DB_PATH, timeout=15)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys = ON")
-    return conn
+    return Database()
 
 
 def get_db():
@@ -136,25 +235,57 @@ def get_db():
 def close_db(_exc):
     db = g.pop("db", None)
     if db is not None:
-        db.close()
+        try:
+            db.close()
+        except DB_ERRORS:
+            pass
+
+
+def _prepare_sqlite_path():
+    """Make sure the SQLite folder is usable; fall back to the app folder instead of crashing."""
+    global DB_PATH, STORAGE_WARNING
+    folder = os.path.dirname(DB_PATH) or "."
+    try:
+        os.makedirs(folder, exist_ok=True)
+        probe = os.path.join(folder, ".write-test")
+        with open(probe, "w") as fh:
+            fh.write("ok")
+        os.remove(probe)
+    except OSError as exc:
+        fallback = os.path.join(BASE_DIR, "data.db")
+        print(f"  WARNING: can't write to {folder} ({exc}). Using {fallback} instead.")
+        DB_PATH = fallback
+        if config.ON_RENDER:
+            STORAGE_WARNING = ("Data is not being saved permanently: no database is connected and no disk is "
+                               "attached, so entries will be lost when Render restarts the app. "
+                               "Add DATABASE_URL in Render (see DEPLOY_RENDER.md).")
+    else:
+        if config.ON_RENDER and not os.environ.get("FGT_DATA_DIR"):
+            STORAGE_WARNING = ("Data is not being saved permanently. Add DATABASE_URL in Render "
+                               "(see DEPLOY_RENDER.md).")
 
 
 def init_db():
-    os.makedirs(os.path.dirname(DB_PATH) or ".", exist_ok=True)
-    first_run = not os.path.exists(DB_PATH)
-    conn = connect()
-    conn.executescript(SCHEMA)
-    cols = {r["name"] for r in conn.execute("PRAGMA table_info(submissions)")}
-    if "report_link" not in cols:  # databases created by the earlier file-upload version
-        conn.execute("ALTER TABLE submissions ADD COLUMN report_link TEXT")
+    if not USE_PG:
+        _prepare_sqlite_path()
+    db = connect()
+    if USE_PG:
+        for stmt in SCHEMA_PG:
+            db.execute(stmt)
+    else:
+        db.conn.executescript(SCHEMA_SQLITE)
+        cols = {r["name"] for r in db.execute("PRAGMA table_info(submissions)")}
+        if "report_link" not in cols:  # databases created by the earlier file-upload version
+            db.execute("ALTER TABLE submissions ADD COLUMN report_link TEXT")
     for k, v in DEFAULT_SETTINGS.items():
-        conn.execute("INSERT OR IGNORE INTO settings(key, value) VALUES (?,?)", (k, v))
+        db.execute("INSERT INTO settings(key, value) VALUES (?,?) ON CONFLICT DO NOTHING", (k, v))
+    first_run = db.execute("SELECT COUNT(*) AS n FROM tests").fetchone()["n"] == 0
     if first_run:
-        seed_data.seed_tests(conn)
+        seed_data.seed_tests(db)
         if config.IMPORT_SHEET_DATA:
-            seed_data.seed_sheet(conn, now_iso())
-    conn.commit()
-    conn.close()
+            seed_data.seed_sheet(db, now_iso())
+    db.commit()
+    db.close()
 
 
 def get_setting(key):
@@ -163,7 +294,8 @@ def get_setting(key):
 
 
 def set_setting(key, value):
-    get_db().execute("INSERT OR REPLACE INTO settings(key, value) VALUES (?,?)", (key, str(value)))
+    get_db().execute("INSERT INTO settings(key, value) VALUES (?,?) "
+                     "ON CONFLICT(key) DO UPDATE SET value = excluded.value", (key, str(value)))
 
 
 def int_setting(key, fallback):
@@ -251,7 +383,7 @@ def active_tests():
 
 def active_flavours():
     return get_db().execute(
-        "SELECT * FROM flavours WHERE active=1 ORDER BY CASE category WHEN 'existing' THEN 0 ELSE 1 END, name COLLATE NOCASE"
+        "SELECT * FROM flavours WHERE active=1 ORDER BY CASE category WHEN 'existing' THEN 0 ELSE 1 END, lower(name)"
     ).fetchall()
 
 
@@ -368,9 +500,10 @@ def inject_globals():
     try:
         groups, awaiting = build_alerts()
         alert_count = sum(1 for gr in groups if gr["urgent"])
-    except sqlite3.Error:
+    except DB_ERRORS:
         alert_count, awaiting = 0, []
     return {"app_name": config.APP_NAME, "alert_count": alert_count, "team_login": bool(config.TEAM_PASSWORD),
+            "storage_warning": STORAGE_WARNING,
             "pending_count": len(awaiting), "is_admin": is_admin(), "today": date.today()}
 
 
@@ -411,7 +544,8 @@ def team_logout():
 
 @app.route("/healthz")
 def healthz():
-    get_db().execute("SELECT 1")
+    # Deliberately doesn't touch the database, so Render's frequent health checks
+    # don't keep a free Neon database awake and use up its monthly hours.
     return "ok"
 
 
@@ -435,7 +569,7 @@ def entry():
             new_name = f.get("new_flavour_name", "").strip()
             if not new_name:
                 errors.append("Type a name for the new flavour.")
-            elif db.execute("SELECT 1 FROM flavours WHERE name=? COLLATE NOCASE", (new_name,)).fetchone():
+            elif db.execute("SELECT 1 FROM flavours WHERE lower(name)=lower(?)", (new_name,)).fetchone():
                 errors.append(f"A flavour called “{new_name}” already exists. Pick it from the list instead.")
         elif not flavour_id.isdigit() or not db.execute("SELECT 1 FROM flavours WHERE id=?", (flavour_id,)).fetchone():
             errors.append("Choose a flavour.")
@@ -468,16 +602,15 @@ def entry():
                                    form=f, selected=test_ids, status_map=status_map_for_js())
 
         if flavour_id == "__new":
-            cur = db.execute("INSERT INTO flavours(name, category, notes, created_at) VALUES (?,?,?,?)",
-                             (new_name, f.get("new_flavour_category", "new"), "", now_iso()))
-            flavour_id = cur.lastrowid
+            flavour_id = db.insert("INSERT INTO flavours(name, category, notes, created_at) VALUES (?,?,?,?)",
+                                   (new_name, f.get("new_flavour_category", "new"), "", now_iso()))
         flavour_id = int(flavour_id)
 
         common = dict(flavour_id=flavour_id, sample_date=sample_date, lab_name=f.get("lab_name", "").strip(),
                       created_by=f.get("created_by", "").strip(), remarks=f.get("remarks", "").strip(),
                       created_at=now_iso())
         if mode == "now":
-            cur = db.execute(
+            sid = db.insert(
                 """INSERT INTO submissions(flavour_id, sample_date, lab_name, status, report_no, report_date, report_link,
                    remarks, created_by, uploaded_by, uploaded_at, created_at)
                    VALUES (:flavour_id, :sample_date, :lab_name, 'complete', :report_no, :report_date, :report_link,
@@ -487,7 +620,7 @@ def entry():
             )
             msg = "Saved with the report link."
         else:
-            cur = db.execute(
+            sid = db.insert(
                 """INSERT INTO submissions(flavour_id, sample_date, lab_name, status, assigned_to, assigned_email,
                    remarks, created_by, created_at)
                    VALUES (:flavour_id, :sample_date, :lab_name, 'awaiting_report', :assigned_to, :assigned_email,
@@ -495,7 +628,6 @@ def entry():
                 dict(common, assigned_to=f.get("assigned_to", "").strip(), assigned_email=f.get("assigned_email", "").strip()),
             )
             msg = f"Saved. {f.get('assigned_to').strip()} has been asked to add the report link."
-        sid = cur.lastrowid
         for tid in test_ids:
             result = f.get(f"result_{tid}", "") if mode == "now" else ""
             db.execute("INSERT INTO submission_tests(submission_id, test_id, result) VALUES (?,?,?)",
@@ -560,12 +692,12 @@ def upload(sid):
             flash("Paste the full Google Drive link to the report (it starts with https://).", "error")
             return redirect(request.url)
         report_no = request.form.get("report_no", "").strip()
-        remarks = request.form.get("remarks", "").strip()
+        remarks = request.form.get("remarks", "").strip() or s["remarks"]
         db.execute(
             """UPDATE submissions SET status='complete', report_no=?, report_date=?, report_link=?,
-               uploaded_by=?, uploaded_at=?, remarks=CASE WHEN ?='' THEN remarks ELSE ? END WHERE id=?""",
+               uploaded_by=?, uploaded_at=?, remarks=? WHERE id=?""",
             (report_no, request.form.get("report_date") or None, link,
-             request.form.get("uploaded_by", "").strip(), now_iso(), remarks, remarks, sid),
+             request.form.get("uploaded_by", "").strip(), now_iso(), remarks, sid),
         )
         for t in tests:
             r = request.form.get(f"result_{t['id']}", "")
@@ -637,7 +769,7 @@ def flavour_detail(fid):
         if not name:
             flash("Flavour name can't be empty.", "error")
             return redirect(request.url)
-        clash = db.execute("SELECT 1 FROM flavours WHERE name=? COLLATE NOCASE AND id<>?", (name, fid)).fetchone()
+        clash = db.execute("SELECT 1 FROM flavours WHERE lower(name)=lower(?) AND id<>?", (name, fid)).fetchone()
         if clash:
             flash(f"Another flavour is already called “{name}”.", "error")
             return redirect(request.url)
@@ -647,7 +779,7 @@ def flavour_detail(fid):
         db.execute("DELETE FROM exclusions WHERE flavour_id=?", (fid,))
         for tid in request.form.getlist("na_tests"):
             if tid.isdigit():
-                db.execute("INSERT OR IGNORE INTO exclusions(flavour_id, test_id) VALUES (?,?)", (fid, int(tid)))
+                db.execute("INSERT INTO exclusions(flavour_id, test_id) VALUES (?,?) ON CONFLICT DO NOTHING", (fid, int(tid)))
         db.commit()
         flash("Flavour updated.", "success")
         return redirect(request.url)
@@ -718,13 +850,13 @@ def admin_tests():
             name = request.form.get("new_name", "").strip()
             if not name:
                 flash("Give the new test a name.", "error")
-            elif db.execute("SELECT 1 FROM tests WHERE name=? COLLATE NOCASE", (name,)).fetchone():
+            elif db.execute("SELECT 1 FROM tests WHERE lower(name)=lower(?)", (name,)).fetchone():
                 flash(f"A test called “{name}” already exists.", "error")
             else:
                 db.execute("INSERT INTO tests(name, covers, frequency_months, price, active, sort_order) VALUES (?,?,?,?,1,?)",
                            (name, request.form.get("new_covers", "").strip(),
                             max(1, int(request.form.get("new_freq") or 12)), _price(request.form.get("new_price")),
-                            (db.execute("SELECT COALESCE(MAX(sort_order),0)+10 FROM tests").fetchone()[0])))
+                            (db.execute("SELECT COALESCE(MAX(sort_order),0)+10 AS n FROM tests").fetchone()["n"])))
                 db.commit()
                 flash(f"Added “{name}”.", "success")
         elif action == "save":
@@ -737,14 +869,17 @@ def admin_tests():
                     freq = max(1, min(60, int(request.form.get(f"freq_{tid}") or 12)))
                 except ValueError:
                     freq = 12
+                if db.execute("SELECT 1 FROM tests WHERE lower(name)=lower(?) AND id<>?", (name, tid)).fetchone():
+                    flash(f"Two tests can't share the name “{name}”. That name wasn't changed.", "error")
+                    name = db.execute("SELECT name FROM tests WHERE id=?", (tid,)).fetchone()["name"]
                 try:
-                    db.execute("UPDATE tests SET name=?, covers=?, frequency_months=?, price=?, active=?, sort_order=? WHERE id=?",
-                               (name, request.form.get(f"covers_{tid}", "").strip(), freq,
-                                _price(request.form.get(f"price_{tid}")),
-                                1 if request.form.get(f"active_{tid}") else 0,
-                                int(request.form.get(f"order_{tid}") or 100), tid))
-                except sqlite3.IntegrityError:
-                    flash(f"Two tests can't share the name “{name}”.", "error")
+                    order = int(request.form.get(f"order_{tid}") or 100)
+                except ValueError:
+                    order = 100
+                db.execute("UPDATE tests SET name=?, covers=?, frequency_months=?, price=?, active=?, sort_order=? WHERE id=?",
+                           (name, request.form.get(f"covers_{tid}", "").strip(), freq,
+                            _price(request.form.get(f"price_{tid}")),
+                            1 if request.form.get(f"active_{tid}") else 0, order, tid))
             lead = request.form.get("lead_days", "")
             if lead.isdigit():
                 set_setting("lead_days", max(1, min(365, int(lead))))
@@ -805,35 +940,40 @@ def admin_settings():
 @app.route("/admin/backup")
 @admin_required
 def admin_backup():
-    """Download the database plus an Excel-friendly list of every entry, as one zip file."""
+    """Download a zip with an Excel-friendly list of every entry plus a full copy of the data."""
     tmpdir = tempfile.mkdtemp()
-    db_copy = os.path.join(tmpdir, "data.db")
     src = connect()
-    dst = sqlite3.connect(db_copy)
-    src.backup(dst)  # consistent snapshot even while the app is in use
-    dst.close()
+    agg = "string_agg" if USE_PG else "GROUP_CONCAT"
 
     out = io.StringIO()
     w = csv.writer(out)
     w.writerow(["Flavour", "Sample sent", "Tests and results", "Lab", "Report no.", "Report date",
                 "Report link", "Status", "Responsible", "Remarks"])
     for r in src.execute(
-        """SELECT s.*, f.name AS flavour_name,
-                  (SELECT GROUP_CONCAT(t.name || CASE WHEN st.result <> '' THEN ' (' || st.result || ')' ELSE '' END, '; ')
+        f"""SELECT s.*, f.name AS flavour_name,
+                  (SELECT {agg}(t.name || CASE WHEN st.result <> '' THEN ' (' || st.result || ')' ELSE '' END, '; ')
                    FROM submission_tests st JOIN tests t ON t.id = st.test_id WHERE st.submission_id = s.id) AS tests
            FROM submissions s JOIN flavours f ON f.id = s.flavour_id
-           ORDER BY f.name COLLATE NOCASE, s.sample_date DESC"""
+           ORDER BY lower(f.name), s.sample_date DESC"""
     ):
         w.writerow([r["flavour_name"], r["sample_date"], r["tests"] or "", r["lab_name"], r["report_no"],
                     r["report_date"] or "", r["report_link"] or "",
                     "Awaiting report" if r["status"] == "awaiting_report" else "Complete",
                     r["assigned_to"], r["remarks"]])
+
+    # Full copy of every table (settings minus the email password), for restoring or moving the data.
+    dump = {}
+    for table in ("flavours", "tests", "submissions", "submission_tests", "exclusions", "settings"):
+        rows = [dict(r) for r in src.execute(f"SELECT * FROM {table}")]
+        if table == "settings":
+            rows = [r for r in rows if r["key"] != "smtp_password"]
+        dump[table] = rows
     src.close()
 
     zip_path = os.path.join(tmpdir, "backup.zip")
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as z:
-        z.write(db_copy, "data.db")
-        z.writestr("all-test-entries.csv", "\ufeff" + out.getvalue())  # BOM so Excel reads ₹ and names correctly
+        z.writestr("all-test-entries.csv", "\ufeff" + out.getvalue())  # BOM so Excel reads names correctly
+        z.writestr("all-data.json", json.dumps(dump, indent=1, ensure_ascii=False, default=str))
 
     @after_this_request
     def _cleanup(response):
@@ -943,8 +1083,9 @@ if __name__ == "__main__":
         print(f"  or http://<this computer's IP>:{config.PORT} from others on the network.")
     if config.ON_RENDER and not config.TEAM_PASSWORD:
         print("  WARNING: FGT_TEAM_PASSWORD is not set, so anyone with the link can open the app.")
-    if config.ON_RENDER and not os.environ.get("FGT_DATA_DIR"):
-        print("  WARNING: FGT_DATA_DIR is not set. Data will be lost when Render restarts the app.")
+    print("  Database: " + ("Postgres (DATABASE_URL)" if USE_PG else DB_PATH))
+    if STORAGE_WARNING:
+        print("  WARNING: " + STORAGE_WARNING)
     print()
     try:
         from waitress import serve

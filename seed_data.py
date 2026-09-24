@@ -57,7 +57,8 @@ FLAVOURS = [
 def seed_tests(db):
     for name, covers, months, price, active, order in DEFAULT_TESTS:
         db.execute(
-            "INSERT OR IGNORE INTO tests(name, covers, frequency_months, price, active, sort_order) VALUES (?,?,?,?,?,?)",
+            "INSERT INTO tests(name, covers, frequency_months, price, active, sort_order) VALUES (?,?,?,?,?,?) "
+            "ON CONFLICT DO NOTHING",
             (name, covers, months, price, active, order),
         )
 
@@ -65,24 +66,23 @@ def seed_tests(db):
 def seed_sheet(db, now_iso):
     test_ids = {r["name"]: r["id"] for r in db.execute("SELECT id, name FROM tests")}
     for name, category, notes, done, waiting in FLAVOURS:
-        cur = db.execute(
+        fid = db.insert(
             "INSERT INTO flavours(name, category, notes, created_at) VALUES (?,?,?,?)",
             (name, category, notes, now_iso),
         )
-        fid = cur.lastrowid
         for day, keys in done:
-            s = db.execute(
+            sid = db.insert(
                 """INSERT INTO submissions(flavour_id, sample_date, lab_name, status, remarks, created_at, source)
                    VALUES (?,?,?,?,?,?,?)""",
                 (fid, day, "", "complete", "Imported from Google Sheet. No report link.", now_iso, "import"),
             )
             for k in keys:
-                db.execute("INSERT INTO submission_tests(submission_id, test_id) VALUES (?,?)", (s.lastrowid, test_ids[T[k]]))
+                db.execute("INSERT INTO submission_tests(submission_id, test_id) VALUES (?,?)", (sid, test_ids[T[k]]))
         for day, keys in waiting:
-            s = db.execute(
+            sid = db.insert(
                 """INSERT INTO submissions(flavour_id, sample_date, lab_name, status, remarks, created_at, source)
                    VALUES (?,?,?,?,?,?,?)""",
                 (fid, day, "Equinox", "awaiting_report", "Imported from Google Sheet.", now_iso, "import"),
             )
             for k in keys:
-                db.execute("INSERT INTO submission_tests(submission_id, test_id) VALUES (?,?)", (s.lastrowid, test_ids[T[k]]))
+                db.execute("INSERT INTO submission_tests(submission_id, test_id) VALUES (?,?)", (sid, test_ids[T[k]]))

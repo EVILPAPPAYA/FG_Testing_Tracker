@@ -1,102 +1,104 @@
-# Hosting the FG Testing Tracker on Render
+# Hosting the FG Testing Tracker on Render (free)
 
-Render runs the app online so your team can open it from anywhere, on any device, at an address like `https://fg-testing-tracker.onrender.com`. Everyone signs in with a team password.
+This setup runs the app on Render's **free** plan and keeps your data in a **free Neon database**, so nothing is lost when Render restarts the app. Neither needs a disk.
 
-Setup takes about 20 minutes. You need a GitHub account (free), a Render account, and a debit or credit card.
+## What the free setup means
 
-## What it costs
+- **The app sleeps.** After 15 minutes with no visitors, the app goes to sleep. The next person to open it waits about a minute while it wakes up. After that it is fast again.
+- **No email alerts.** Render's free plan blocks outgoing email. Alerts still show inside the app: the red banner, the Alerts page and the sidebar counts.
+- **Neon's free limits are plenty for this app.** You get 0.5 GB of storage (enough for tens of thousands of test entries) and 100 compute hours a month. The database also sleeps when unused, which saves those hours.
 
-| Item | Plan | Approx. cost |
-|---|---|---|
-| Web service | `0.5c-512mb` (formerly "Starter") | $7 per month |
-| Persistent disk | 1 GB | $0.25 per month |
+To get email alerts and stop the sleeping later, change the Render instance type to **Starter** (about $7/month). Keep the Neon database; nothing else changes.
 
-Check https://render.com/pricing for current rates.
+## If you already created the Web Service (your case)
 
-**Why not the free plan?** The lab reports stay in Google Drive, but the app's own records (flavours, test dates, results and the report links) are kept in a small database file. Free Render services can't attach a persistent disk, so that file would be wiped every time Render restarts the app. Free services also can't send email, so reminders would never go out.
+Your deploy failed because `FGT_DATA_DIR` points to `/var/data`, which only exists when a paid disk is attached. The steps below fix it.
 
-## Step 1: Put the app on GitHub
+### Step 1: Create the free Neon database
 
-Render deploys from a GitHub repository.
+1. Go to https://neon.com and sign up. Your Google account is fine, and no card is needed.
+2. Create a project:
+   - **Name:** `fg-testing-tracker`
+   - **Postgres version:** leave the default
+   - **Region:** **AWS Asia Pacific (Singapore)**. This should match your Render region; if your Render service is in another region, pick the closest Neon region to it.
+3. On the project dashboard, click **Connect**. Copy the **connection string**. It looks like
+   `postgresql://neondb_owner:abc123@ep-cool-name-123456-pooler.ap-southeast-1.aws.neon.tech/neondb?sslmode=require`
 
-1. Sign up or sign in at https://github.com
-2. Click **+** (top right) and choose **New repository**.
-3. Name it `fg-testing-tracker`, choose **Private**, and leave every other box unticked. Click **Create repository**.
-4. On the next page, click the link **uploading an existing file**.
-5. Unzip `fg-testing-tracker.zip` on your computer and open the `fg-tracker` folder.
-6. Select **everything inside** that folder and drag it into the browser window: `app.py`, `config.py`, `render.yaml`, `requirements.txt`, the `templates` and `static` folders, and the rest.
+   Leave "Connection pooling" on, which is the default. Treat this string like a password.
 
-   Do **not** upload `.venv` or `data.db` if they exist. They are created when you run the app on your own computer and don't belong on GitHub.
-7. Click **Commit changes**.
+### Step 2: Upload the new files to GitHub
 
-Check that `render.yaml` and `app.py` appear at the top level of the repository, not inside a sub-folder.
+1. Unzip `fg-testing-tracker.zip` and open the `fg-tracker` folder.
+2. In your GitHub repository, click **Add file**, then **Upload files**.
+3. Select **everything inside** the `fg-tracker` folder, drag it in, and click **Commit changes**. Files with the same name are replaced automatically.
 
-## Step 2: Create the app on Render
+The files that changed are `app.py`, `config.py`, `seed_data.py`, `requirements.txt`, `render.yaml`, `templates/base.html` and `templates/admin_settings.html`. Uploading everything is simplest and safe.
 
-1. Go to https://dashboard.render.com and sign up **with your GitHub account**.
-2. Click **New** (top right), then **Blueprint**.
-3. Connect GitHub if asked, allow Render to see the `fg-testing-tracker` repository, and select it.
-4. Render reads `render.yaml` and shows one web service, `fg-testing-tracker`, with a 1 GB disk.
-5. Enter the two passwords Render asks for:
-   - **FGT_TEAM_PASSWORD**: everyone on the team uses this to sign in.
-   - **FGT_ADMIN_PASSWORD**: opens Test schedule and Settings. Keep this one to QA heads.
+### Step 3: Fix the environment variables on Render
 
-   Use long passwords that are different from each other.
-6. Add your card if Render asks, then click **Deploy Blueprint** (or **Apply**).
-7. Open the service and watch **Logs**. After two to four minutes you'll see:
+1. Open your service on https://dashboard.render.com and go to **Environment**.
+2. **Delete** `FGT_DATA_DIR`. This is what caused the crash.
+3. **Add** a variable:
+   - **Key:** `DATABASE_URL`
+   - **Value:** the Neon connection string from Step 1
+4. Keep `FGT_TEAM_PASSWORD`, `FGT_ADMIN_PASSWORD` and `FGT_SECRET_KEY` as they are. If `FGT_SECRET_KEY` is missing, add it with any long random text.
+5. Click **Save, rebuild, and deploy**. If you only see **Save Changes**, click it, then use **Manual Deploy**, then **Deploy latest commit**.
+
+### Step 4: Check it worked
+
+1. Open **Logs**. After two to four minutes you should see:
    ```
    FG Testing Tracker is running.
-   Live at https://fg-testing-tracker.onrender.com
+   Database: Postgres (DATABASE_URL)
    ```
+2. Open your app's address (shown at the top of the service page) and sign in with the team password.
+3. The dashboard should show your 21 flavours.
+4. Add a test entry, then restart the service (**Manual Deploy**, then **Restart service**). If the entry is still there afterwards, your data is being saved permanently.
 
-Your address is shown at the top of the service page. It may have extra letters if the name was taken.
+## Creating the Web Service from scratch (for reference)
 
-The app is created in Render's **Singapore** region, the closest to India. To choose another region, change `region:` in `render.yaml` before Step 2; it can't be changed afterwards.
+If you ever need to set it up again: create the Neon database first (Step 1), then in Render click **New**, then **Web Service**, pick the repository, and enter:
 
-## Step 3: Check it works
+| Setting | Value |
+|---|---|
+| Language | Python 3 |
+| Branch | `main` |
+| Region | Singapore |
+| Build Command | `pip install -r requirements.txt` |
+| Start Command | `python app.py` |
+| Instance Type | Free |
+| Health Check Path (under Advanced) | `/healthz` |
 
-1. Open your app's address and sign in with the team password.
-2. The dashboard shows your 21 flavours with the dates imported from the Google Sheet.
-3. On **New test entry**, log a test with a real Google Drive report link. Use **Test link** to check it opens, then save.
-4. Open the flavour's page and click **Open report** to confirm the link works.
-5. Open **Test schedule**, enter the admin password, and set the repeat intervals you want.
-6. Share the address and the team password with your team. On phones, "Add to Home Screen" makes it open like an app.
+Under **Environment Variables**, add:
 
-## Step 4: Turn on email alerts
+| Key | Value |
+|---|---|
+| `DATABASE_URL` | the Neon connection string |
+| `FGT_TEAM_PASSWORD` | the password your team signs in with |
+| `FGT_ADMIN_PASSWORD` | the password for Test schedule and Settings |
+| `FGT_SECRET_KEY` | any long random text |
 
-In **Settings** (back end), fill in the email section exactly as described in `README.md`, section 6. For Gmail, use `smtp.gmail.com`, port `587`, TLS ticked, and a Gmail **app password**.
-
-Then click **Send test email**.
-
-Paid Render services can send on ports 587 and 465. Port 25 is blocked on Render, so don't use it.
+Don't add `FGT_DATA_DIR`, and don't add a disk.
 
 ## Report links
 
 The app saves only the link to each report; the files stay in Google Drive. For a link to open for your team, its sharing must allow them. In Google Drive, right-click the report, choose **Share**, and under **General access** choose your company or "Anyone with the link".
 
-A tidy way to keep this in order is one shared Drive folder, e.g. `FSSAI Test Reports`, shared with the team once. Every report placed inside it is then viewable by everyone.
+The simplest approach is one shared Drive folder, e.g. `FSSAI Test Reports`, shared with the team once. Every report placed inside it is then viewable by everyone.
 
 ## Backups
 
-- Render takes an automatic **snapshot** of the disk every day and keeps it for at least seven days. Restore one from the service's **Disk** page.
-- Once a week, go to **Settings** and click **Download backup (.zip)**. It contains the database and `all-test-entries.csv`, a spreadsheet of every entry with its report link. Save it to Google Drive.
-
-## Changing things later
-
-- **Passwords:** open the service in Render, go to **Environment**, edit `FGT_TEAM_PASSWORD` or `FGT_ADMIN_PASSWORD`, and save. Render restarts the app with the new value.
-- **App updates:** upload changed files to the GitHub repository. Render redeploys automatically within a few minutes. Your data stays safe on the disk. The app is unavailable for a few seconds during each redeploy.
-- **Your own domain** (e.g. `tests.yourbrand.in`): add it under the service's **Settings > Custom Domains** and follow Render's DNS instructions.
+- Neon's free plan can restore the database to any moment in the **last 6 hours**, from the Neon dashboard.
+- Once a week, go to **Settings** in the app and click **Download backup (.zip)**. It contains `all-test-entries.csv` (every entry with its report link, which opens in Excel) and `all-data.json` (a complete copy of the data). Save it to Google Drive.
 
 ## If something goes wrong
 
-**Data disappeared after a redeploy.** Check **Environment**: `FGT_DATA_DIR` must be `/var/data`. Then check **Disk**: the mount path must also be `/var/data`.
+**A red banner says "Data is not being saved permanently".** `DATABASE_URL` is missing or empty. Add it under **Environment** (Step 3).
 
-**The build fails.** Make sure `render.yaml` and `requirements.txt` are at the top level of the GitHub repository.
+**The logs say "password authentication failed" or "could not connect".** The connection string was copied incompletely. Copy it again from Neon's **Connect** button and replace the `DATABASE_URL` value.
 
-**Anyone can open the app without a password.** `FGT_TEAM_PASSWORD` is empty. Set it under **Environment**.
+**The app takes about a minute to open.** It was asleep, which is normal on the free plan. Starter ($7/month) keeps it awake.
 
-**A teammate sees "You need access" when opening a report.** The link works, but the file isn't shared with them. Change its sharing in Google Drive as described under Report links.
+**A teammate sees "You need access" when opening a report.** The link works, but the file isn't shared with them. Change its sharing in Google Drive, as described under Report links.
 
-**Emails don't arrive.** Open **Logs** and look for "Email notification run failed". The usual causes are using your normal Gmail password instead of an app password, or a port other than 587 or 465.
-
-**The app says it can't be reached.** Open the service in Render and check its status. If a deploy failed, the **Logs** page shows why.
+**The database stopped responding near the end of the month.** The free Neon compute hours ran out. It resumes at the start of the next month, or you can upgrade in Neon. This is unlikely for a team this size.
